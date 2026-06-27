@@ -1,0 +1,44 @@
+{
+  "summary": "Phase 1 MVP backend testing complete for Profit Scout AI. 23/23 new tests passing (100%) for inventory CRUD + metrics, /inventory-meta, CSV export, /stats/home, /stats/sourcing, /stats/reports (daily/weekly/monthly/yearly), /score (Profit Scout Score), /settings round-trip, plus regression for /api/auth, /api/search, /api/profit/verdict, /api/pallets, /api/history. Full suite (including iteration_1 regression) is 39/39 PASS. Math verified exactly: purchase=80, sale=220, fees=29, shipping=9 → total_cost=118, net_profit=102, roi_pct=127.5, profit_margin_pct=46.4. PATCH status='sold' correctly auto-sets date_sold. Settings GET defaults (light/USD/true) → POST {theme:dark} / {currency:EUR} / {notifications_enabled:false} → GET reflects all changes (upsert works). /score returns score 0-100, verdict in {BUY,MAYBE,DO NOT BUY}, all 5 subscores in range, deterministic net_profit and roi_pct math validated, ebay_snapshot keys present. /stats/reports rows[] populated for every period; totals aggregate correctly. /stats/sourcing rows show per-source revenue/profit/roi/items/sold/avg_days_to_sell with best/worst. CSV export returns {filename, csv, count} with header + data rows. No 502s from Gemini observed in this run.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/inventory/export", "issue": "Endpoint returns JSON {filename, csv, count} rather than a raw text/csv response. Request literally said 'returns CSV string'; current shape works for the mobile client (string available under body.csv) but a true CSV Content-Type download would be more REST-conventional. Not blocking."},
+      {"endpoint": "GET /api/stats/sourcing", "issue": "worst_source falls back to the lowest-profit row even when its profit >= 0 (single-source case). Minor UX nit; behaves fine when multiple sources exist."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_phase1_commercial.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/pytest/pytest_phase1.xml"
+  ],
+  "action_items": [
+    "(Optional) Consider returning /api/inventory/export as a true text/csv attachment alongside the JSON wrapper, if any non-mobile client expects a downloadable file.",
+    "(Optional) Refactor server.py (~1180 lines) into routers (auth, inventory, stats, score, settings, pallets, scan) for maintainability.",
+    "Frontend (Expo) was not tested in this pass per request — main agent has already manually validated screens."
+  ],
+  "critical_code_review_comments": [
+    "server.py is 1180 lines and crossing the 700-line guideline — splitting into routers is recommended.",
+    "Route ordering correct: /api/inventory/export defined before /api/inventory/{iid}, so /export is not shadowed by the path param.",
+    "All MongoDB reads correctly project out _id ({'_id': 0}); no ObjectId leakage observed in any response.",
+    "_compute_inventory_metrics handles None sale_price safely (ROI/margin guarded against div-by-zero).",
+    "Settings upsert is per-user via {'user_id': user['id']}; defaults returned cleanly when no doc exists.",
+    "/api/score uses mock_ebay_data (deterministic) so subscores are reproducible — good for offline/testing."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_phase1_commercial.py (created — 23 new tests for Phase 1 endpoints + regression)"
+  ],
+  "success_rate": {"backend": "100% (39/39 across both test files; 23/23 new Phase 1 tests)", "frontend": "not tested (per request)"},
+  "seed_data_creation": "Seeded user tester@profitscout.app / TestPass123! verified via /api/auth/login. Phase 1 stats tests use a fresh TEST_-prefixed user so aggregate assertions are deterministic (no pollution from prior runs). Inventory items created during tests are scoped to that fresh user and stay isolated.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Re-run all backend tests with: `set -a && . /app/frontend/.env && set +a && pytest /app/backend/tests/ -v`. EXPO_PUBLIC_BACKEND_URL must be in env. Phase 1 tests live in /app/backend/tests/test_phase1_commercial.py. Stats-related tests register a fresh TEST_ user per module to keep aggregates deterministic. /api/inventory/export currently returns JSON envelope {filename, csv, count} — not a raw CSV stream. Gemini AI endpoints (/api/search, /api/profit/verdict, /api/score uses mock_ebay only) — 502s on AI-backed endpoints are acceptable upstream failures; tests skip in those cases.",
+  "rca_of_issue": "N/A — no product bugs found in Phase 1 endpoints. All math (metrics, score, sourcing, reports) verified exactly against expected values."
+}

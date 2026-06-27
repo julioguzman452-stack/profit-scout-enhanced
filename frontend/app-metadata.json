@@ -1,0 +1,8 @@
+{
+  "name": "Profit Scout AI",
+  "version": "1.0.0",
+  "description": "Product scanning and profit analysis app for resellers",
+  "package": "com.profitscout.app",
+  "minSdkVersion": 24,
+  "targetSdkVersion": 36
+}

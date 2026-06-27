@@ -1,0 +1,41 @@
+{
+  "summary": "Profit Scout AI RC1 release-candidate health check PASS. RC1-specific suite: 9/9 PASS. Regression suite (backend_test.py): 16/16 PASS. Total: 25/25 backend tests green. (1) POST /api/scan/identify-barcode {barcode:'012345678905', type:'ean13'} returns exactly {barcode, barcode_type:'ean13', lookup_status:'unavailable', lookup_message:'UPC captured, but live product lookup is not connected yet.', data_source:'captured_only'} — NO product_name, brand, or fabricated fields. Empty barcode still returns 400. (2) POST /api/profit/verdict with buy_cost=80, sell_price=220, shipping=9, ebay_fee_pct=13.25 returns verdict=BUY, ebay_fee=29.15, total_cost=118.15, net_profit=101.85, roi_pct=127.3, profit_margin_pct=46.3, break_even_price=102.59 — exact match to spec math 89/(1-0.1325)=102.5936. (3) Edge case buy=0, sell=0 does not crash; all numeric fields including break_even_price are 0. (4) Smoke checks green: /auth/login, /search (mock eBay snapshot keys present), /score (0–100 score + verdict), /stats/home, /inventory list. Updated outdated regression test test_identify_barcode in backend_test.py to match RC1 contract (was asserting fake product_name/data_source='mock' from pre-RC1 behavior).",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_rc1.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_rc1.xml",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "None for RC1 scope — all targeted fixes verified working.",
+    "(Carry-over, not blocking) Wire a real GTIN lookup (UPCitemDB / Open Food Facts) so /scan/identify-barcode can return real product_name + brand instead of just lookup_status='unavailable'.",
+    "(Carry-over) Consider splitting server.py (1238 lines) into routers — flagged in iteration_2 already."
+  ],
+  "critical_code_review_comments": [
+    "/api/scan/identify-barcode now correctly avoids fabrication (server.py:345-363); response is deterministic and honest about lookup not being connected.",
+    "/api/profit/verdict break-even math (server.py:393-396) uses the correct algebra: fixed/(1-fee_rate); guarded against fee_rate>=1 to avoid div-by-zero.",
+    "profit_margin_pct guarded by sell_price>0 check (server.py:397) so buy=0/sell=0 edge case returns 0 cleanly without crash.",
+    "ProfitIn defaults (ebay_fee_pct=13.25, shipping_cost=0, tax_cost=0, extra_cost=0) make minimal-payload edge case safe.",
+    "Frontend env key is EXPO_PUBLIC_BACKEND_URL (not EXPO_BACKEND_URL); both tests read from EXPO_PUBLIC_BACKEND_URL with EXPO_BACKEND_URL fallback so they keep working under either convention."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_rc1.py (CREATED — 9 RC1-scoped tests)",
+    "/app/backend/tests/backend_test.py (updated test_identify_barcode to match RC1 contract: now asserts lookup_status='unavailable' and absence of product_name/brand)"
+  ],
+  "success_rate": {"backend": "100% (25/25 — 9/9 RC1 + 16/16 regression)", "frontend": "not tested (per RC1 request)"},
+  "seed_data_creation": "Reused seeded user tester@profitscout.app / TestPass123! (auto-registers if not present). No new test data created beyond standard test fixtures.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "RC1 dedicated tests live at /app/backend/tests/test_rc1.py. Run all backend tests: `set -a && . /app/frontend/.env && set +a && pytest /app/backend/tests/ -v`. EXPO_PUBLIC_BACKEND_URL must be set. Barcode endpoint contract: returns {barcode, barcode_type, lookup_status:'unavailable', lookup_message, data_source:'captured_only'} — do NOT expect product_name/brand. /profit/verdict response now includes profit_margin_pct and break_even_price (break_even = (buy+shipping+tax+extra) / (1 - ebay_fee_pct/100)).",
+  "rca_of_issue": "N/A — all RC1 fixes verified correct. Two transient smoke-test failures during initial run were testing-side schema-shape misses (wrong field names for /score & /stats/home), fixed in the same iteration; not product bugs."
+}
