@@ -11,7 +11,7 @@ import requests
 BASE_URL = (
     os.environ.get("EXPO_PUBLIC_BACKEND_URL")
     or os.environ.get("EXPO_BACKEND_URL")
-    or "https://ebay-flipper-1.preview.emergentagent.com"
+    or "https://ai-insight-complete.preview.emergentagent.com"
 ).rstrip("/")
 API = f"{BASE_URL}/api"
 
