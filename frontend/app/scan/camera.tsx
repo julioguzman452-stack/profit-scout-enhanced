@@ -37,6 +37,7 @@ export default function ScanCamera() {
   const [loading, setLoading] = useState(false);
   const [detected, setDetected] = useState<Detected | null>(null);
   const [notFound, setNotFound] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
     if (!permission) return;
@@ -77,6 +78,7 @@ export default function ScanCamera() {
   const sendToAi = async (b64: string) => {
     setLoading(true);
     setNotFound(false);
+    setErrorMsg(null);
     setDetected(null);
     try {
       // Check cache first
@@ -90,26 +92,37 @@ export default function ScanCamera() {
       // Compress image for faster transmission
       const compressed = compressImage(b64);
 
-      // Send to AI with timeout
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
-
       const r = await api<Detected>("/scan/identify-image", {
         method: "POST",
         body: { image_base64: compressed },
+        timeoutMs: 30_000,
       });
-
-      clearTimeout(timeoutId);
 
       if (isUsableMatch(r)) {
         cacheResult(b64, r);
         setDetected(r);
       } else {
         setNotFound(true);
+        setErrorMsg(r?.product_name === "Unknown item"
+          ? "Unable to identify product from image."
+          : null);
       }
     } catch (e: any) {
       console.error("AI identification error:", e);
       setNotFound(true);
+      const msg = typeof e?.detail === "string" ? e.detail : (e?.message || "");
+      // Map common errors to friendly copy
+      if (/timed out|timeout/i.test(msg)) {
+        setErrorMsg("AI service timed out. Please try again.");
+      } else if (/unavailable|API key|EMERGENT/i.test(msg)) {
+        setErrorMsg("AI service unavailable. Please try again later.");
+      } else if (/Image too large/i.test(msg)) {
+        setErrorMsg("Image is too large. Retake at lower quality.");
+      } else if (/Invalid image/i.test(msg)) {
+        setErrorMsg("Invalid image. Please retake the photo.");
+      } else {
+        setErrorMsg(msg || "Unable to identify product. Please try again.");
+      }
     } finally {
       setLoading(false);
     }
@@ -256,11 +269,11 @@ export default function ScanCamera() {
           </View>
           <View style={s.notFoundCard}>
             <Ionicons name="alert-circle-outline" size={40} color={colors.warn} />
-            <Text style={s.notFoundTitle}>No product detected</Text>
-            <Text style={s.notFoundText}>Try again or enter item manually.</Text>
+            <Text style={s.notFoundTitle}>{errorMsg ? "AI could not identify this photo" : "No product detected"}</Text>
+            <Text style={s.notFoundText}>{errorMsg || "Try again or enter item manually."}</Text>
           </View>
           <View style={s.actions}>
-            <Pressable testID="nf-retry" style={s.primaryBtn} onPress={() => setNotFound(false)}>
+            <Pressable testID="nf-retry" style={s.primaryBtn} onPress={() => { setNotFound(false); setErrorMsg(null); }}>
               <Ionicons name="refresh" size={18} color={colors.primaryText} />
               <Text style={s.primaryBtnText}>Try again</Text>
             </Pressable>

@@ -16,7 +16,15 @@ import { Ionicons } from "@expo/vector-icons";
 import { api } from "@/src/api/client";
 import { colors, radius, spacing } from "@/src/theme";
 
-type Capture = { code: string; type: string; status: string; message: string };
+type Product = { title: string; brand?: string; model?: string; category?: string; description?: string; image?: string };
+type Capture = {
+  code: string;
+  type: string;
+  status: "found" | "not_found";
+  message: string;
+  product: Product | null;
+  searchQuery: string;
+};
 
 export default function ScanBarcode() {
   const router = useRouter();
@@ -35,18 +43,25 @@ export default function ScanBarcode() {
     if (capture || loading) return;
     setLoading(true);
     try {
-      const res = await api<{ barcode: string; barcode_type: string; lookup_status: string; lookup_message: string }>(
-        "/scan/identify-barcode",
-        { method: "POST", body: { barcode: data, type } },
-      );
+      const res = await api<{
+        barcode: string;
+        barcode_type: string;
+        lookup_status: "found" | "not_found";
+        lookup_message?: string;
+        product?: Product;
+        search_query?: string;
+      }>("/scan/identify-barcode", { method: "POST", body: { barcode: data, type }, timeoutMs: 20_000 });
       setCapture({
         code: res.barcode,
         type: res.barcode_type || type || "unknown",
         status: res.lookup_status,
-        message: res.lookup_message,
+        message: res.lookup_status === "found" ? "" : (res.lookup_message || "Product not found"),
+        product: res.product || null,
+        searchQuery: res.search_query || res.barcode,
       });
     } catch (e: any) {
-      Alert.alert("Lookup failed", e.message || "Try again");
+      const msg = typeof e?.detail === "string" ? e.detail : (e?.message || "Try again");
+      Alert.alert("Lookup failed", msg);
     } finally {
       setLoading(false);
     }
@@ -111,17 +126,32 @@ export default function ScanBarcode() {
               </View>
               <View style={s.detailCell}>
                 <Text style={s.label}>LOOKUP</Text>
-                <Text style={[s.detailText, { color: colors.warn }]}>{capture.status}</Text>
+                <Text style={[s.detailText, { color: capture.status === "found" ? colors.good : colors.bad }]}>
+                  {capture.status === "found" ? "Found" : "Not found"}
+                </Text>
               </View>
             </View>
 
-            <View style={s.warnBox}>
-              <Ionicons name="information-circle" size={18} color={colors.warn} />
-              <Text style={s.warnText}>{capture.message}</Text>
-            </View>
+            {capture.status === "found" && capture.product ? (
+              <View style={s.foundBox}>
+                <Text style={s.label}>PRODUCT</Text>
+                <Text style={s.productName}>{capture.product.title}</Text>
+                {capture.product.brand ? (
+                  <Text style={s.productMeta}>Brand: {capture.product.brand}</Text>
+                ) : null}
+                {capture.product.category ? (
+                  <Text style={s.productMeta}>Category: {capture.product.category}</Text>
+                ) : null}
+              </View>
+            ) : (
+              <View style={s.warnBox}>
+                <Ionicons name="information-circle" size={18} color={colors.warn} />
+                <Text style={s.warnText}>{capture.message || "Product not found"}</Text>
+              </View>
+            )}
 
-            <Text style={s.label}>FINAL SEARCH QUERY</Text>
-            <Text testID="cap-final-query" style={s.queryValue}>{capture.code}</Text>
+            <Text style={s.label}>SEARCH QUERY</Text>
+            <Text testID="cap-final-query" style={s.queryValue}>{capture.searchQuery}</Text>
           </View>
 
           <View style={s.actions}>
@@ -129,11 +159,11 @@ export default function ScanBarcode() {
               testID="cap-search-code"
               style={s.primaryBtn}
               onPress={() =>
-                router.replace({ pathname: "/product", params: { q: capture.code, source: "barcode" } })
+                router.replace({ pathname: "/product", params: { q: capture.searchQuery, source: "barcode" } })
               }
             >
               <Ionicons name="search" size={18} color={colors.primaryText} />
-              <Text style={s.primaryBtnText}>Search this code</Text>
+              <Text style={s.primaryBtnText}>Check live pricing</Text>
             </Pressable>
             <Pressable
               testID="cap-use-camera-ai"
@@ -244,6 +274,17 @@ const s = StyleSheet.create({
     marginVertical: spacing.sm,
   },
   warnText: { flex: 1, color: "#7c5e0a", fontSize: 12, lineHeight: 17 },
+  foundBox: {
+    backgroundColor: colors.goodBg,
+    borderColor: colors.goodBorder,
+    borderWidth: 1,
+    padding: spacing.sm,
+    borderRadius: radius.md,
+    marginVertical: spacing.sm,
+    gap: 2,
+  },
+  productName: { fontSize: 16, fontWeight: "800", color: colors.text, marginTop: 2 },
+  productMeta: { fontSize: 12, color: colors.textMuted, marginTop: 2 },
   queryValue: { fontSize: 15, fontWeight: "700", color: colors.text, fontFamily: "Courier" },
   actions: { gap: spacing.sm },
   primaryBtn: {

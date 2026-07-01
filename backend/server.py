@@ -4,24 +4,26 @@ Mock eBay layer + Gemini 3.1 Pro Preview AI + JWT auth + pallet mode.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import csv
-import hashlib
 import io
 import json
 import logging
 import os
-import random
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, List, Optional
+from urllib.parse import quote_plus
 
 import bcrypt
+import httpx
 import jwt
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field
@@ -220,91 +222,209 @@ async def me(user=Depends(get_current_user)):
     return user
 
 
-# ---------------- Mock eBay data ----------------
-def _seeded_random(query: str) -> random.Random:
-    seed = int(hashlib.md5(query.lower().encode()).hexdigest()[:8], 16)
-    return random.Random(seed)
+# ---------------- eBay Browse API (OAuth client-credentials) ----------------
+EBAY_APP_ID = os.environ.get("EBAY_APP_ID", "").strip()
+EBAY_CERT_ID = os.environ.get("EBAY_CERT_ID", "").strip()
+EBAY_MARKETPLACE_ID = os.environ.get("EBAY_MARKETPLACE_ID", "EBAY_US").strip() or "EBAY_US"
+EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
+EBAY_BROWSE_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+
+_ebay_token_cache: dict = {"token": None, "expires_at": 0.0}
 
 
-def mock_marketplace_data(query: str, platform: str) -> dict:
-    """Return realistic-looking but synthetic marketplace price data."""
-    rng = _seeded_random(f"{query}-{platform}")
-    # Vary base price by platform
-    platform_multiplier = {"amazon": 1.1, "mercari": 0.9, "whatnot": 1.05, "facebook": 0.85}.get(platform, 1.0)
-    base = rng.uniform(15, 220) * platform_multiplier
-    active_count = rng.randint(3, 150)
-    avg_price = round(base * rng.uniform(0.8, 1.3), 2)
-    low_price = round(base * rng.uniform(0.5, 0.8), 2)
-    high_price = round(base * rng.uniform(1.2, 1.6), 2)
-    
-    listings = []
-    for _ in range(5):
+def ebay_configured() -> bool:
+    return bool(EBAY_APP_ID and EBAY_CERT_ID)
+
+
+async def _ebay_get_token() -> str:
+    """Fetch (and cache) an application access token via client-credentials."""
+    now = time.time()
+    if _ebay_token_cache["token"] and _ebay_token_cache["expires_at"] - 60 > now:
+        return _ebay_token_cache["token"]
+    if not ebay_configured():
+        raise HTTPException(status_code=503, detail="eBay API not configured")
+    basic = base64.b64encode(f"{EBAY_APP_ID}:{EBAY_CERT_ID}".encode()).decode()
+    headers = {
+        "Authorization": f"Basic {basic}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    body = "grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope"
+    async with httpx.AsyncClient(timeout=15.0) as client_http:
+        r = await client_http.post(EBAY_OAUTH_URL, content=body, headers=headers)
+    if r.status_code != 200:
+        logger.error("eBay OAuth failed %s: %s", r.status_code, r.text[:400])
+        raise HTTPException(status_code=502, detail="eBay authentication failed")
+    j = r.json()
+    tok = j.get("access_token")
+    exp = int(j.get("expires_in", 7200))
+    if not tok:
+        raise HTTPException(status_code=502, detail="eBay returned no access token")
+    _ebay_token_cache["token"] = tok
+    _ebay_token_cache["expires_at"] = now + exp
+    return tok
+
+
+async def ebay_browse_search(query: str, limit: int = 30) -> dict:
+    """Call eBay Browse API. Returns real active-listing data only.
+
+    Raises HTTPException 503 if not configured, 502 on API failure.
+    """
+    token = await _ebay_get_token()
+    params = {
+        "q": query,
+        "limit": str(min(max(limit, 1), 50)),
+        "sort": "bestMatch",
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-EBAY-C-MARKETPLACE-ID": EBAY_MARKETPLACE_ID,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client_http:
+        r = await client_http.get(EBAY_BROWSE_URL, params=params, headers=headers)
+    if r.status_code == 401:
+        # token expired mid-flight — clear cache and retry once
+        _ebay_token_cache["token"] = None
+        _ebay_token_cache["expires_at"] = 0.0
+        token = await _ebay_get_token()
+        headers["Authorization"] = f"Bearer {token}"
+        async with httpx.AsyncClient(timeout=20.0) as client_http:
+            r = await client_http.get(EBAY_BROWSE_URL, params=params, headers=headers)
+    if r.status_code != 200:
+        logger.error("eBay Browse failed %s: %s", r.status_code, r.text[:400])
+        raise HTTPException(status_code=502, detail="eBay search failed")
+    payload = r.json()
+    total = int(payload.get("total") or 0)
+    items_raw = payload.get("itemSummaries") or []
+    prices: List[float] = []
+    listings: List[dict] = []
+    for it in items_raw:
+        price_obj = it.get("price") or {}
+        try:
+            val = float(price_obj.get("value", 0) or 0)
+        except (TypeError, ValueError):
+            val = 0.0
+        if val <= 0:
+            continue
+        prices.append(val)
+        ship_val = 0.0
+        opts = it.get("shippingOptions") or []
+        if opts:
+            try:
+                ship_val = float(((opts[0] or {}).get("shippingCost") or {}).get("value", 0) or 0)
+            except (TypeError, ValueError):
+                ship_val = 0.0
         listings.append({
-            "title": f"{query}",
-            "price": round(base * rng.uniform(0.7, 1.5), 2),
-            "shipping": round(rng.choice([0, 3.99, 6.99, 9.99]), 2) if platform != "facebook" else 0,
+            "title": (it.get("title") or "")[:200],
+            "price": round(val, 2),
+            "currency": price_obj.get("currency", "USD"),
+            "shipping": round(ship_val, 2),
+            "condition": it.get("condition") or "",
+            "seller": ((it.get("seller") or {}).get("username")) or "",
+            "url": it.get("itemWebUrl") or "",
+            "image": ((it.get("image") or {}).get("imageUrl")) or "",
         })
-    
+    if not prices:
+        return {
+            "available": True,
+            "query": query,
+            "active_count": total,
+            "avg_price": 0.0,
+            "median_price": 0.0,
+            "lowest_price": 0.0,
+            "highest_price": 0.0,
+            "listings": [],
+            "data_source": "ebay_browse_api",
+            "marketplace": EBAY_MARKETPLACE_ID,
+            "message": "No active listings matched this query.",
+        }
+    prices_sorted = sorted(prices)
+    avg = round(sum(prices) / len(prices), 2)
+    lo = round(prices_sorted[0], 2)
+    hi = round(prices_sorted[-1], 2)
+    med = round(prices_sorted[len(prices_sorted) // 2], 2)
     return {
-        "platform": platform,
+        "available": True,
         "query": query,
-        "active_count": active_count,
-        "avg_price": avg_price,
-        "lowest_price": low_price,
-        "highest_price": high_price,
-        "listings": listings,
-        "data_source": "mock",
+        "active_count": total,
+        "sample_count": len(prices),
+        "avg_price": avg,
+        "median_price": med,
+        "lowest_price": lo,
+        "highest_price": hi,
+        "listings": listings[:12],
+        "data_source": "ebay_browse_api",
+        "marketplace": EBAY_MARKETPLACE_ID,
     }
 
 
-def mock_ebay_data(query: str) -> dict:
-    """Return realistic-looking but synthetic eBay sold/active comps."""
-    rng = _seeded_random(query)
-    base = rng.uniform(15, 220)
-    sold_count = rng.randint(8, 140)
-    active_count = rng.randint(5, 250)
-    sold_prices = sorted([round(base * rng.uniform(0.55, 1.45), 2) for _ in range(min(sold_count, 30))])
-    if not sold_prices:
-        sold_prices = [round(base, 2)]
-    avg = round(sum(sold_prices) / len(sold_prices), 2)
-    low = sold_prices[0]
-    high = sold_prices[-1]
-    median = sold_prices[len(sold_prices) // 2]
-    sell_through = round((sold_count / max(active_count + sold_count, 1)) * 100, 1)
-    recent_sold = []
-    for p in sold_prices[-8:][::-1]:
-        days = rng.randint(1, 30)
-        recent_sold.append({
-            "title": f"{query} (used, good condition)",
-            "price": p,
-            "sold_days_ago": days,
-            "condition": rng.choice(["New", "Used", "Pre-Owned", "Like New"]),
-        })
-    active_listings = []
-    for _ in range(8):
-        active_listings.append({
-            "title": f"{query} — {rng.choice(['BIN', 'Auction'])}",
-            "price": round(base * rng.uniform(0.7, 1.6), 2),
-            "shipping": round(rng.choice([0, 4.99, 8.99, 12.99]), 2),
-        })
+# ---------------- UPCitemDB free trial lookup ----------------
+UPCDB_URL = "https://api.upcitemdb.com/prod/trial/lookup"
+
+
+async def upc_lookup(code: str) -> Optional[dict]:
+    """Look up UPC/EAN via UPCitemDB free trial (no key required, 100/day/IP).
+
+    Returns None if not found or the service is unavailable. Never fabricates.
+    """
+    if not code or not code.strip():
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client_http:
+            r = await client_http.get(UPCDB_URL, params={"upc": code.strip()})
+    except Exception:
+        logger.exception("UPCitemDB request failed")
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        j = r.json()
+    except Exception:
+        return None
+    items = j.get("items") or []
+    if not items:
+        return None
+    it = items[0]
+    title = (it.get("title") or "").strip()
+    if not title:
+        return None
     return {
-        "query": query,
-        "active_count": active_count,
-        "sold_count": sold_count,
-        "avg_sold_price": avg,
-        "median_sold_price": median,
-        "lowest_sold_price": low,
-        "highest_sold_price": high,
-        "sell_through_rate": sell_through,
-        "recent_sold": recent_sold,
-        "active_listings": active_listings,
-        "data_source": "mock",
+        "title": title,
+        "brand": (it.get("brand") or "").strip(),
+        "model": (it.get("model") or "").strip(),
+        "category": (it.get("category") or "").strip(),
+        "description": (it.get("description") or "").strip()[:500],
+        "image": (it.get("images") or [None])[0],
+    }
+
+
+# ---------------- Marketplace deep-link helpers ----------------
+def marketplace_links(query: str) -> dict:
+    q = quote_plus(query.strip())
+    return {
+        "ebay": f"https://www.ebay.com/sch/i.html?_nkw={q}&LH_Sold=1&LH_Complete=1",
+        "ebay_active": f"https://www.ebay.com/sch/i.html?_nkw={q}",
+        "amazon": f"https://www.amazon.com/s?k={q}",
+        "facebook": f"https://www.facebook.com/marketplace/search/?query={q}",
+        "mercari": f"https://www.mercari.com/search/?keyword={q}",
+        "whatnot": f"https://www.whatnot.com/search/{q}",
     }
 
 
 # ---------------- Emergent AI helpers ----------------
+AI_TIMEOUT_SECONDS = 25.0
+
+
 async def ai_chat(system: str, user_text: str, image_b64: Optional[str] = None) -> str:
-    """Call Gemini 3.1 Pro Preview via emergentintegrations."""
+    """Call Gemini via emergentintegrations with a hard timeout.
+
+    Raises HTTPException 503 on any AI failure (missing key, import error,
+    timeout, upstream error). Never hangs.
+    """
+    api_key = os.environ.get("EMERGENT_LLM_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="AI service unavailable: missing API key")
     try:
         from emergentintegrations.llm.chat import (
             ImageContent,
@@ -313,17 +433,13 @@ async def ai_chat(system: str, user_text: str, image_b64: Optional[str] = None) 
         )
     except Exception as e:
         logger.exception("emergentintegrations import failed")
-        raise HTTPException(status_code=500, detail=f"AI library not available: {e}")
-
-    api_key = os.environ.get("EMERGENT_LLM_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="EMERGENT_LLM_KEY missing")
+        raise HTTPException(status_code=503, detail=f"AI service unavailable: {e}")
 
     chat = LlmChat(
         api_key=api_key,
         session_id=f"ps-{uuid.uuid4()}",
         system_message=system,
-    ).with_model("gemini", "gemini-3.1-pro-preview")
+    ).with_model("gemini", "gemini-2.5-pro")
 
     file_contents = []
     if image_b64:
@@ -331,10 +447,15 @@ async def ai_chat(system: str, user_text: str, image_b64: Optional[str] = None) 
 
     msg = UserMessage(text=user_text, file_contents=file_contents or None)
     try:
-        reply = await chat.send_message(msg)
+        reply = await asyncio.wait_for(chat.send_message(msg), timeout=AI_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning("AI call timed out after %ss", AI_TIMEOUT_SECONDS)
+        raise HTTPException(status_code=504, detail="AI service timed out. Please try again.")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("AI call failed")
-        raise HTTPException(status_code=502, detail=f"AI error: {e}")
+        raise HTTPException(status_code=503, detail=f"AI service unavailable: {e}")
     return reply if isinstance(reply, str) else str(reply)
 
 
@@ -360,73 +481,226 @@ def _extract_json(text: str) -> dict:
 @api.post("/scan/identify-image")
 async def identify_image(body: IdentifyImageIn, user=Depends(get_current_user)):
     """Gemini vision: identify product from photo, return structured info."""
+    if not body.image_base64 or len(body.image_base64) < 200:
+        raise HTTPException(status_code=400, detail="Invalid image payload")
+    if len(body.image_base64) > 10 * 1024 * 1024:  # ~10 MB base64 cap
+        raise HTTPException(status_code=413, detail="Image too large. Please retake at lower quality.")
     system = (
         "You are a reseller product identification expert. From a single product photo "
         "extract a clean JSON object with these keys exactly: product_name, brand, model, "
         "category, condition, ebay_search_keywords (array of 3-6 strings), confidence (0-1). "
+        "If the photo does not clearly show a product, return "
+        '{"product_name":"Unknown item","confidence":0.0,"ebay_search_keywords":[]}. '
         "Return ONLY raw JSON, no commentary, no markdown."
     )
     reply = await ai_chat(system, "Identify this item for eBay resale.", image_b64=body.image_base64)
     data = _extract_json(reply)
     if not data:
-        data = {"product_name": "Unknown item", "ebay_search_keywords": [], "confidence": 0.0, "raw": reply[:300]}
+        return {
+            "product_name": "Unknown item",
+            "ebay_search_keywords": [],
+            "confidence": 0.0,
+            "error": "Unable to identify product from image.",
+        }
     return data
 
 
 @api.post("/scan/identify-barcode")
 async def identify_barcode(payload: dict, user=Depends(get_current_user)):
-    """Return the captured barcode + a clear 'lookup not connected' status.
-
-    We deliberately do NOT invent product names. Real UPC->product lookup
-    requires a GTIN database (UPCitemDB, Open Food Facts, etc.) which is not
-    wired yet. The frontend treats this barcode as the search query directly.
-    """
+    """Real UPC/EAN lookup via UPCitemDB. Never fabricates a product name."""
     code = str(payload.get("barcode", "")).strip()
     btype = str(payload.get("type", "")).strip()
     if not code:
         raise HTTPException(status_code=400, detail="barcode required")
+    product = await upc_lookup(code)
+    if product:
+        return {
+            "barcode": code,
+            "barcode_type": btype or "unknown",
+            "lookup_status": "found",
+            "product": product,
+            "data_source": "upcitemdb",
+            "search_query": product["title"],
+        }
     return {
         "barcode": code,
         "barcode_type": btype or "unknown",
-        "lookup_status": "unavailable",
-        "lookup_message": "UPC captured, but live product lookup is not connected yet.",
-        "data_source": "captured_only",
+        "lookup_status": "not_found",
+        "lookup_message": "Product not found",
+        "data_source": "upcitemdb",
+        "search_query": code,
+    }
+
+
+async def _ai_insight_for_ebay(query: str, ebay: dict, buy_cost: float = 0.0, ebay_fee_pct: float = 13.25) -> dict:
+    """Generate real-data-only AI insight from live eBay Browse results.
+
+    Never fabricates prices. If AI is unavailable, returns a deterministic
+    fallback derived from the real numbers.
+    """
+    avg = float(ebay.get("avg_price") or 0)
+    lo = float(ebay.get("lowest_price") or 0)
+    hi = float(ebay.get("highest_price") or 0)
+    med = float(ebay.get("median_price") or avg)
+    active = int(ebay.get("active_count") or 0)
+    listings_preview = ebay.get("listings") or []
+
+    # Deterministic profit math on the REAL median price
+    fee_rate = ebay_fee_pct / 100.0
+    expected_sale = med if med > 0 else avg
+    fees = round(expected_sale * fee_rate, 2)
+    expected_profit = round(expected_sale - fees - buy_cost, 2) if expected_sale > 0 else 0.0
+    roi_pct = round((expected_profit / buy_cost) * 100, 1) if buy_cost > 0 else 0.0
+
+    system = (
+        "You are a reseller analyst. You will receive REAL live eBay Browse data. "
+        "Analyze the numbers to produce a decision. NEVER invent prices, listing counts, "
+        "or sold data. Only reason about the numbers provided. "
+        "Return ONLY raw JSON with these keys: "
+        '{"verdict": "BUY"|"MAYBE BUY"|"AVOID", '
+        '"risk_level": "Low"|"Medium"|"High", '
+        '"sell_through_recommendation": string (1 sentence, plain english), '
+        '"reasoning": string (2 short sentences citing the real numbers)}. '
+        "No markdown, no extra keys."
+    )
+    prompt_payload = {
+        "query": query,
+        "buy_cost": buy_cost,
+        "ebay_fee_pct": ebay_fee_pct,
+        "computed_expected_profit": expected_profit,
+        "computed_roi_pct": roi_pct,
+        "ebay_active_count": active,
+        "ebay_avg_price": avg,
+        "ebay_median_price": med,
+        "ebay_low_price": lo,
+        "ebay_high_price": hi,
+        "sample_titles": [it.get("title", "")[:80] for it in listings_preview[:5]],
+    }
+    ai: dict = {}
+    try:
+        reply = await ai_chat(system, json.dumps(prompt_payload))
+        ai = _extract_json(reply) or {}
+    except HTTPException as e:
+        logger.info("AI insight fallback: %s", e.detail)
+        ai = {}
+
+    verdict = str(ai.get("verdict") or "").upper()
+    if verdict not in {"BUY", "MAYBE BUY", "AVOID"}:
+        # deterministic fallback verdict
+        if buy_cost > 0 and expected_profit >= max(5, buy_cost * 0.5):
+            verdict = "BUY"
+        elif buy_cost > 0 and expected_profit >= max(2, buy_cost * 0.2):
+            verdict = "MAYBE BUY"
+        elif buy_cost <= 0 and expected_sale > 0:
+            verdict = "MAYBE BUY"
+        else:
+            verdict = "AVOID"
+
+    risk_level = str(ai.get("risk_level") or "").capitalize()
+    if risk_level not in {"Low", "Medium", "High"}:
+        if active <= 5:
+            risk_level = "High"
+        elif active >= 50:
+            risk_level = "Low"
+        else:
+            risk_level = "Medium"
+
+    sell_rec = str(ai.get("sell_through_recommendation") or "").strip()
+    if not sell_rec:
+        if active >= 100:
+            sell_rec = f"Highly competitive category with {active} active listings — price competitively and use fast shipping."
+        elif active >= 20:
+            sell_rec = f"Moderate competition ({active} active listings). Aim near median price for a reasonable sell-through window."
+        elif active >= 1:
+            sell_rec = f"Low competition ({active} active listings) — you can price near the higher end."
+        else:
+            sell_rec = "No active competition found; niche demand — sell-through may be slow."
+
+    reasoning = str(ai.get("reasoning") or "").strip()
+    if not reasoning:
+        reasoning = (
+            f"Median active eBay price is ${med:.2f} across {active} listings "
+            f"(range ${lo:.2f}–${hi:.2f}). "
+            + (f"Expected profit at that price is ${expected_profit:.2f} ({roi_pct}% ROI)." if buy_cost > 0
+               else "Provide a buy cost to compute exact ROI.")
+        )
+
+    return {
+        "verdict": verdict,
+        "risk_level": risk_level,
+        "sell_through_recommendation": sell_rec,
+        "reasoning": reasoning,
+        "expected_sale_price": round(expected_sale, 2),
+        "estimated_low": round(lo, 2),
+        "estimated_high": round(hi, 2),
+        "expected_profit": expected_profit,
+        "roi_pct": roi_pct,
+        "ebay_fee_estimated": fees,
+        "based_on": "ebay_browse_api",
+        "sample_size": ebay.get("sample_count") or len(listings_preview),
     }
 
 
 @api.post("/search")
 async def search(body: SearchIn, user=Depends(get_current_user)):
-    """Mock eBay search + AI keyword suggestions + multi-platform price comparison."""
+    """Live eBay Browse search + AI insight on the real data. No mock data.
+
+    Response shape:
+      {
+        "query": str,
+        "ebay": {...} | null,
+        "pricing_available": bool,
+        "pricing_message": str,   # user-facing reason if not available
+        "ai_insight": {...} | null,
+        "marketplace_links": {ebay, ebay_active, amazon, facebook, mercari, whatnot}
+      }
+    """
     query = body.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="query required")
-    ebay = mock_ebay_data(query)
-    
-    # Generate mock comparison data for other platforms
-    amazon = mock_marketplace_data(query, "amazon")
-    mercari = mock_marketplace_data(query, "mercari")
-    whatnot = mock_marketplace_data(query, "whatnot")
-    facebook = mock_marketplace_data(query, "facebook")
-    
-    # AI keyword suggestion (optional, best-effort)
+
+    links = marketplace_links(query)
+    if not ebay_configured():
+        return {
+            "query": query,
+            "ebay": None,
+            "pricing_available": False,
+            "pricing_message": "eBay API not configured",
+            "ai_insight": None,
+            "marketplace_links": links,
+        }
+
     try:
-        system = (
-            "You are an eBay listing optimization expert. Given a product query, return JSON "
-            "with keys: improved_keywords (array of 5 strings best for eBay search), tips (array of 3 short strings). "
-            "ONLY raw JSON."
-        )
-        ai_reply = await ai_chat(system, f"Query: {query}")
-        ai = _extract_json(ai_reply) or {"improved_keywords": [], "tips": []}
-    except HTTPException:
-        ai = {"improved_keywords": [], "tips": []}
-    
+        ebay = await ebay_browse_search(query)
+    except HTTPException as e:
+        logger.info("eBay live fetch failed: %s", e.detail)
+        return {
+            "query": query,
+            "ebay": None,
+            "pricing_available": False,
+            "pricing_message": "Live pricing unavailable" if e.status_code != 503 else "eBay API not configured",
+            "ai_insight": None,
+            "marketplace_links": links,
+        }
+
+    if not ebay.get("listings"):
+        return {
+            "query": query,
+            "ebay": ebay,
+            "pricing_available": False,
+            "pricing_message": "No live eBay listings found for this query.",
+            "ai_insight": None,
+            "marketplace_links": links,
+        }
+
+    insight = await _ai_insight_for_ebay(query, ebay)
     return {
+        "query": query,
         "ebay": ebay,
-        "amazon": amazon,
-        "mercari": mercari,
-        "whatnot": whatnot,
-        "facebook": facebook,
-        "ai": ai
+        "pricing_available": True,
+        "pricing_message": "",
+        "ai_insight": insight,
+        "marketplace_links": links,
     }
 
 
@@ -445,9 +719,9 @@ async def profit_verdict(body: ProfitIn, user=Depends(get_current_user)):
     if roi >= 50 and net >= 5:
         verdict = "BUY"
     elif roi >= 20 and net >= 2:
-        verdict = "MAYBE"
+        verdict = "MAYBE BUY"
     else:
-        verdict = "DO NOT BUY"
+        verdict = "AVOID"
 
     # AI explanation (best-effort)
     explanation = ""
@@ -1187,17 +1461,35 @@ class ScoreIn(BaseModel):
 
 @api.post("/score")
 async def profit_scout_score(body: ScoreIn, user=Depends(get_current_user)):
-    """Compute 0-100 Profit Scout Score from demand, competition, profit, velocity, seasonality."""
-    ebay = mock_ebay_data(body.query)
-    fee = body.sell_price * (body.ebay_fee_pct / 100)
-    net = body.sell_price - (body.buy_cost + body.shipping_cost + body.extra_cost + fee)
+    """Compute 0-100 Profit Scout Score from real eBay data + profit math.
+
+    Requires eBay API. If unavailable, returns {"available": false, ...} so the
+    UI can render "Live pricing unavailable" instead of fake values.
+    """
+    if not ebay_configured():
+        return {"available": False, "message": "eBay API not configured"}
+    try:
+        ebay = await ebay_browse_search(body.query)
+    except HTTPException as e:
+        return {"available": False, "message": e.detail if isinstance(e.detail, str) else "Live pricing unavailable"}
+    if not ebay.get("listings"):
+        return {"available": False, "message": "No live eBay listings for this query."}
+
+    med = float(ebay.get("median_price") or ebay.get("avg_price") or 0)
+    active = int(ebay.get("active_count") or 0)
+    sale_price = body.sell_price if body.sell_price > 0 else med
+    fee = sale_price * (body.ebay_fee_pct / 100)
+    net = sale_price - (body.buy_cost + body.shipping_cost + body.extra_cost + fee)
     roi = (net / body.buy_cost * 100) if body.buy_cost > 0 else 0
-    # subscores 0-100
-    demand = min(100, round(ebay["sold_count"] / 1.5))
-    competition = max(0, 100 - min(100, round(ebay["active_count"] / 2.5)))
+
+    # subscores 0-100 — all from REAL data
+    #  - demand proxy: sample_count (unique listings returned)
+    demand = min(100, round(int(ebay.get("sample_count") or 0) * 4))
+    #  - competition: lower active_count is better (cap at 250 = 0)
+    competition = max(0, 100 - min(100, round(active / 2.5)))
     profit_s = max(0, min(100, round(roi)))
-    velocity = min(100, round(ebay["sell_through_rate"]))
-    # Seasonality: simple per-month boost (holiday gear in Nov/Dec, summer in Jun/Jul)
+    #  - velocity: unknown without sold data — use active-count proxy
+    velocity = min(100, max(0, round(100 - (active / 3.0)))) if active else 50
     month = datetime.now().month
     season_table = {1: 50, 2: 50, 3: 55, 4: 60, 5: 65, 6: 70, 7: 70, 8: 65, 9: 65, 10: 75, 11: 90, 12: 95}
     seasonality = season_table.get(month, 60)
@@ -1212,10 +1504,11 @@ async def profit_scout_score(body: ScoreIn, user=Depends(get_current_user)):
     if score >= 70:
         verdict = "BUY"
     elif score >= 45:
-        verdict = "MAYBE"
+        verdict = "MAYBE BUY"
     else:
-        verdict = "DO NOT BUY"
+        verdict = "AVOID"
     return {
+        "available": True,
         "score": int(score),
         "verdict": verdict,
         "subscores": {
@@ -1228,10 +1521,10 @@ async def profit_scout_score(body: ScoreIn, user=Depends(get_current_user)):
         "net_profit": round(net, 2),
         "roi_pct": round(roi, 1),
         "ebay_snapshot": {
-            "active_count": ebay["active_count"],
-            "sold_count": ebay["sold_count"],
-            "avg_sold_price": ebay["avg_sold_price"],
-            "sell_through_rate": ebay["sell_through_rate"],
+            "active_count": active,
+            "avg_price": ebay.get("avg_price"),
+            "median_price": ebay.get("median_price"),
+            "sample_count": ebay.get("sample_count"),
         },
     }
 

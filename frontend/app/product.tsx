@@ -16,26 +16,63 @@ import { Ionicons } from "@expo/vector-icons";
 import { api } from "@/src/api/client";
 import { colors, radius, spacing } from "@/src/theme";
 
-type EbayData = {
-  active_count: number;
-  sold_count: number;
-  avg_sold_price: number;
-  median_sold_price: number;
-  lowest_sold_price: number;
-  highest_sold_price: number;
-  sell_through_rate: number;
-  recent_sold: { title: string; price: number; sold_days_ago: number; condition: string }[];
+type EbayListing = {
+  title: string;
+  price: number;
+  currency: string;
+  shipping: number;
+  condition: string;
+  seller: string;
+  url: string;
+  image?: string;
 };
 
-type MarketplaceData = {
-  platform: string;
+type EbayData = {
+  available: boolean;
   query: string;
   active_count: number;
+  sample_count?: number;
   avg_price: number;
+  median_price: number;
   lowest_price: number;
   highest_price: number;
-  listings: { title: string; price: number; shipping: number }[];
+  listings: EbayListing[];
   data_source: string;
+  marketplace?: string;
+  message?: string;
+};
+
+type AiInsight = {
+  verdict: "BUY" | "MAYBE BUY" | "AVOID";
+  risk_level: "Low" | "Medium" | "High";
+  sell_through_recommendation: string;
+  reasoning: string;
+  expected_sale_price: number;
+  estimated_low: number;
+  estimated_high: number;
+  expected_profit: number;
+  roi_pct: number;
+  ebay_fee_estimated: number;
+  based_on: string;
+  sample_size: number;
+};
+
+type MarketplaceLinks = {
+  ebay: string;
+  ebay_active: string;
+  amazon: string;
+  facebook: string;
+  mercari: string;
+  whatnot: string;
+};
+
+type SearchResp = {
+  query: string;
+  ebay: EbayData | null;
+  pricing_available: boolean;
+  pricing_message: string;
+  ai_insight: AiInsight | null;
+  marketplace_links: MarketplaceLinks;
 };
 
 export default function ProductScreen() {
@@ -46,12 +83,7 @@ export default function ProductScreen() {
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [ebay, setEbay] = useState<EbayData | null>(null);
-  const [amazon, setAmazon] = useState<MarketplaceData | null>(null);
-  const [mercari, setMercari] = useState<MarketplaceData | null>(null);
-  const [whatnot, setWhatnot] = useState<MarketplaceData | null>(null);
-  const [facebook, setFacebook] = useState<MarketplaceData | null>(null);
-  const [ai, setAi] = useState<{ improved_keywords?: string[]; tips?: string[] } | null>(null);
+  const [data, setData] = useState<SearchResp | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
@@ -59,18 +91,15 @@ export default function ProductScreen() {
     setLoading(true);
     setError(null);
     try {
-      const r = await api<{ ebay: EbayData; amazon: MarketplaceData; mercari: MarketplaceData; whatnot: MarketplaceData; facebook: MarketplaceData; ai: any }>("/search", {
+      const r = await api<SearchResp>("/search", {
         method: "POST",
         body: { query: q },
+        timeoutMs: 45_000,
       });
-      setEbay(r.ebay);
-      setAmazon(r.amazon || null);
-      setMercari(r.mercari || null);
-      setWhatnot(r.whatnot || null);
-      setFacebook(r.facebook || null);
-      setAi(r.ai || null);
+      setData(r);
     } catch (e: any) {
-      setError(e.message || "Failed");
+      const msg = typeof e?.detail === "string" ? e.detail : (e?.message || "Failed");
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -81,7 +110,7 @@ export default function ProductScreen() {
   }, [q, load]);
 
   const save = async () => {
-    if (!ebay || saving) return;
+    if (!data || saving) return;
     setSaving(true);
     try {
       await api("/history", {
@@ -90,34 +119,27 @@ export default function ProductScreen() {
           title: q,
           query: q,
           source,
-          ebay_data: ebay,
-          ai_insight: ai,
-          marketplace_data: { amazon, mercari, whatnot, facebook },
+          ebay_data: data.ebay,
+          ai_insight: data.ai_insight,
         },
       });
       setSaved(true);
     } catch (e: any) {
-      Alert.alert("Save failed", e.message || "");
+      const msg = typeof e?.detail === "string" ? e.detail : (e?.message || "");
+      Alert.alert("Save failed", msg);
     } finally {
       setSaving(false);
     }
   };
 
-  const openFbMarketplace = () => {
-    const url = `https://www.facebook.com/marketplace/search/?query=${encodeURIComponent(q)}`;
-    Linking.openURL(url).catch(() => {});
+  const openLink = (url?: string) => {
+    if (!url) return;
+    Linking.openURL(url).catch(() => Alert.alert("Cannot open link"));
   };
 
-  const openExternal = (which: "ebay" | "amazon" | "fb" | "mercari") => {
-    const encQ = encodeURIComponent(q);
-    const map: Record<string, string> = {
-      ebay: `https://www.ebay.com/sch/i.html?_nkw=${encQ}`,
-      amazon: `https://www.amazon.com/s?k=${encQ}`,
-      fb: `https://www.facebook.com/marketplace/search/?query=${encQ}`,
-      mercari: `https://www.mercari.com/search/?keyword=${encQ}`,
-    };
-    Linking.openURL(map[which]).catch(() => {});
-  };
+  const ebay = data?.ebay || null;
+  const ai = data?.ai_insight || null;
+  const links = data?.marketplace_links;
 
   return (
     <SafeAreaView style={s.safe} edges={["top"]}>
@@ -126,7 +148,7 @@ export default function ProductScreen() {
           <Ionicons name="chevron-back" size={22} color={colors.text} />
         </Pressable>
         <Text style={s.headerTitle} numberOfLines={1}>{q}</Text>
-        <Pressable testID="product-save" onPress={save} disabled={saving || saved} style={s.iconBtn}>
+        <Pressable testID="product-save" onPress={save} disabled={saving || saved || !data} style={s.iconBtn}>
           <Ionicons name={saved ? "bookmark" : "bookmark-outline"} size={22} color={colors.text} />
         </Pressable>
       </View>
@@ -135,87 +157,122 @@ export default function ProductScreen() {
         {loading ? (
           <View style={s.loading}>
             <ActivityIndicator color={colors.primary} size="large" />
-            <Text style={s.loadingText}>Fetching market data…</Text>
+            <Text style={s.loadingText}>Fetching live market data…</Text>
           </View>
         ) : error ? (
           <View style={s.errBox}>
+            <Ionicons name="alert-circle" size={32} color={colors.bad} />
             <Text style={s.errText}>{error}</Text>
-            <Pressable onPress={load} style={s.retryBtn}><Text style={s.retryText}>Retry</Text></Pressable>
+            <Pressable onPress={load} style={s.retryBtn}>
+              <Text style={s.retryText}>Retry</Text>
+            </Pressable>
           </View>
-        ) : ebay ? (
+        ) : data ? (
           <>
-            <View style={s.section}>
-              <Text style={s.sectionTitle}>Price comparison</Text>
-              <Text style={s.sectionSub}>Live prices across major marketplaces</Text>
-              <View style={s.comparisonGrid}>
-                {ebay && <ComparisonCard platform="eBay" data={{ platform: "ebay", query: q, active_count: ebay.active_count, avg_price: ebay.avg_sold_price, lowest_price: ebay.lowest_sold_price, highest_price: ebay.highest_sold_price, listings: ebay.recent_sold as any, data_source: "mock" }} />}
-                {amazon && <ComparisonCard platform="Amazon" data={amazon} />}
-                {mercari && <ComparisonCard platform="Mercari" data={mercari} />}
-                {whatnot && <ComparisonCard platform="Whatnot" data={whatnot} />}
-                {facebook && <ComparisonCard platform="Facebook" data={facebook} />}
-              </View>
-            </View>
-
-            <View style={s.section}>
-              <Text style={s.sectionTitle}>eBay snapshot</Text>
-              <Text style={s.sectionSub}>Detailed eBay market data</Text>
-              <View style={s.kpiGrid}>
-                <Kpi label="ACTIVE" value={`${ebay.active_count}`} />
-                <Kpi label="SOLD" value={`${ebay.sold_count}`} />
-                <Kpi label="SELL-THROUGH" value={`${ebay.sell_through_rate}%`} />
-              </View>
-              <View style={s.kpiGrid}>
-                <Kpi label="AVG SOLD" value={`$${ebay.avg_sold_price}`} />
-                <Kpi label="LOW" value={`$${ebay.lowest_sold_price}`} />
-                <Kpi label="HIGH" value={`$${ebay.highest_sold_price}`} />
-              </View>
-            </View>
-
-            <View style={s.section}>
-              <View style={s.rowBetween}>
-                <Text style={s.sectionTitle}>AI insight</Text>
-                <Ionicons name="sparkles" size={16} color={colors.accent} />
-              </View>
-              {ai?.improved_keywords?.length ? (
-                <>
-                  <Text style={s.subLabel}>Better keywords</Text>
-                  <View style={s.chipRow}>
-                    {ai.improved_keywords.map((k, i) => (
-                      <View key={`${k}-${i}`} style={s.chip}>
-                        <Text style={s.chipText}>{k}</Text>
-                      </View>
-                    ))}
+            {/* eBay snapshot or unavailable banner */}
+            {data.pricing_available && ebay ? (
+              <View style={s.section}>
+                <View style={s.rowBetween}>
+                  <Text style={s.sectionTitle}>eBay live snapshot</Text>
+                  <View style={s.livePill}>
+                    <View style={s.liveDot} />
+                    <Text style={s.livePillText}>LIVE</Text>
                   </View>
-                </>
-              ) : (
-                <Text style={s.muted}>No AI suggestions.</Text>
-              )}
-              {ai?.tips?.length ? (
-                <>
-                  <Text style={[s.subLabel, { marginTop: spacing.sm }]}>Tips</Text>
-                  {ai.tips.map((t, i) => (
-                    <View key={i} style={s.tipRow}>
-                      <Ionicons name="checkmark-circle" size={14} color={colors.good} />
-                      <Text style={s.tipText}>{t}</Text>
-                    </View>
-                  ))}
-                </>
-              ) : null}
-            </View>
-
-            <View style={s.section}>
-              <Text style={s.sectionTitle}>Recent sold</Text>
-              <Text style={s.sectionSub}>Recent eBay sales</Text>
-              {ebay.recent_sold.slice(0, 6).map((r, i) => (
-                <View key={i} style={s.soldRow}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={s.soldTitle} numberOfLines={1}>{r.title}</Text>
-                    <Text style={s.soldMeta}>{r.condition} · {r.sold_days_ago}d ago</Text>
-                  </View>
-                  <Text style={s.soldPrice}>${r.price}</Text>
                 </View>
-              ))}
+                <Text style={s.sectionSub}>
+                  {ebay.active_count} active listings · {ebay.marketplace || "EBAY_US"}
+                </Text>
+                <View style={s.kpiGrid}>
+                  <Kpi label="AVG" value={`$${ebay.avg_price.toFixed(2)}`} />
+                  <Kpi label="MEDIAN" value={`$${ebay.median_price.toFixed(2)}`} />
+                  <Kpi label="RANGE" value={`$${ebay.lowest_price.toFixed(0)}–$${ebay.highest_price.toFixed(0)}`} />
+                </View>
+              </View>
+            ) : (
+              <View style={[s.section, s.unavailableSection]}>
+                <View style={s.rowBetween}>
+                  <Text style={s.sectionTitle}>Live pricing</Text>
+                  <Ionicons name="cloud-offline-outline" size={18} color={colors.warn} />
+                </View>
+                <Text style={s.unavailableText}>
+                  {data.pricing_message || "Live pricing unavailable"}
+                </Text>
+              </View>
+            )}
+
+            {/* AI Insight — only when we have real data */}
+            {ai ? (
+              <View style={s.section}>
+                <View style={s.rowBetween}>
+                  <Text style={s.sectionTitle}>AI Insight</Text>
+                  <Ionicons name="sparkles" size={16} color={colors.accent} />
+                </View>
+                <VerdictPill verdict={ai.verdict} />
+                <View style={s.kpiGrid}>
+                  <Kpi label="EXPECTED SALE" value={`$${ai.expected_sale_price.toFixed(2)}`} />
+                  <Kpi label="EXPECTED PROFIT" value={`$${ai.expected_profit.toFixed(2)}`} />
+                  <Kpi label="ROI" value={`${ai.roi_pct}%`} />
+                </View>
+                <View style={s.kpiGrid}>
+                  <Kpi label="RISK LEVEL" value={ai.risk_level} />
+                  <Kpi label="EBAY FEE (EST.)" value={`$${ai.ebay_fee_estimated.toFixed(2)}`} />
+                  <Kpi label="SAMPLE" value={`${ai.sample_size}`} />
+                </View>
+                <Text style={s.subLabel}>SELL-THROUGH RECOMMENDATION</Text>
+                <Text style={s.insightText}>{ai.sell_through_recommendation}</Text>
+                <Text style={[s.subLabel, { marginTop: spacing.sm }]}>REASONING</Text>
+                <Text style={s.insightText}>{ai.reasoning}</Text>
+              </View>
+            ) : (
+              <View style={[s.section, s.unavailableSection]}>
+                <View style={s.rowBetween}>
+                  <Text style={s.sectionTitle}>AI Insight</Text>
+                  <Ionicons name="sparkles" size={16} color={colors.textMuted} />
+                </View>
+                <Text style={s.unavailableText}>
+                  AI insight requires live pricing. Configure eBay API to enable this feature.
+                </Text>
+              </View>
+            )}
+
+            {/* Marketplace buttons — always available */}
+            <View style={s.section}>
+              <Text style={s.sectionTitle}>View on marketplaces</Text>
+              <Text style={s.sectionSub}>Opens the real search page for this item</Text>
+              <View style={s.mpGrid}>
+                <MpBtn testID="mp-ebay" icon="pricetag" label="eBay" bg="#e53238" onPress={() => openLink(links?.ebay_active)} />
+                <MpBtn testID="mp-amazon" icon="logo-amazon" label="Amazon" bg="#ff9900" onPress={() => openLink(links?.amazon)} />
+                <MpBtn testID="mp-facebook" icon="logo-facebook" label="Facebook Marketplace" bg="#1877f2" onPress={() => openLink(links?.facebook)} />
+                <MpBtn testID="mp-mercari" icon="cart" label="Mercari" bg="#5c6ac4" onPress={() => openLink(links?.mercari)} />
+                <MpBtn testID="mp-whatnot" icon="videocam" label="Whatnot" bg="#ffde3a" fg="#0f172a" onPress={() => openLink(links?.whatnot)} />
+              </View>
             </View>
+
+            {/* Real active eBay listings */}
+            {ebay && ebay.listings.length > 0 ? (
+              <View style={s.section}>
+                <Text style={s.sectionTitle}>Active eBay listings</Text>
+                <Text style={s.sectionSub}>Real live listings — tap to open in browser</Text>
+                {ebay.listings.slice(0, 8).map((l, i) => (
+                  <Pressable key={i} onPress={() => openLink(l.url)} style={s.listRow}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={s.listTitle} numberOfLines={2}>{l.title}</Text>
+                      <Text style={s.listMeta}>
+                        {l.condition || "—"}{l.seller ? ` · ${l.seller}` : ""}
+                      </Text>
+                    </View>
+                    <View style={s.listPriceCol}>
+                      <Text style={s.listPrice}>${l.price.toFixed(2)}</Text>
+                      {l.shipping > 0 ? (
+                        <Text style={s.listShip}>+ ${l.shipping.toFixed(2)} ship</Text>
+                      ) : (
+                        <Text style={s.listShipFree}>Free ship</Text>
+                      )}
+                    </View>
+                  </Pressable>
+                ))}
+              </View>
+            ) : null}
 
             <View style={s.actionRow}>
               <Pressable
@@ -251,44 +308,48 @@ function Kpi({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ComparisonCard({ platform, data }: { platform: string; data: MarketplaceData }) {
+function VerdictPill({ verdict }: { verdict: string }) {
+  const map: Record<string, { bg: string; fg: string; icon: any }> = {
+    "BUY": { bg: colors.goodBg, fg: colors.good, icon: "checkmark-circle" },
+    "MAYBE BUY": { bg: colors.warnBg, fg: colors.warn, icon: "help-circle" },
+    "AVOID": { bg: colors.badBg, fg: colors.bad, icon: "close-circle" },
+  };
+  const style = map[verdict?.toUpperCase()] || map["AVOID"];
   return (
-    <View style={s.compCard}>
-      <Text style={s.compPlatform}>{platform}</Text>
-      <View style={s.compPrices}>
-        <View style={s.compPrice}>
-          <Text style={s.compLabel}>LOW</Text>
-          <Text style={s.compValue}>${data.lowest_price}</Text>
-        </View>
-        <View style={s.compPrice}>
-          <Text style={s.compLabel}>AVG</Text>
-          <Text style={s.compValue}>${data.avg_price}</Text>
-        </View>
-        <View style={s.compPrice}>
-          <Text style={s.compLabel}>HIGH</Text>
-          <Text style={s.compValue}>${data.highest_price}</Text>
-        </View>
-      </View>
-      <Text style={s.compCount}>{data.active_count} listings</Text>
+    <View style={[s.verdictPill, { backgroundColor: style.bg }]}>
+      <Ionicons name={style.icon} size={20} color={style.fg} />
+      <Text style={[s.verdictText, { color: style.fg }]}>{verdict}</Text>
     </View>
   );
 }
 
-function MpBtn({ testID, icon, label, bg, onPress }: any) {
+function MpBtn({
+  testID, icon, label, bg, fg, onPress,
+}: {
+  testID: string; icon: any; label: string; bg: string; fg?: string; onPress: () => void;
+}) {
+  const textColor = fg || "#fff";
   return (
-    <Pressable testID={testID} onPress={onPress} style={({ pressed }) => [{
-      width: "48.5%",
-      backgroundColor: bg,
-      borderRadius: radius.md,
-      height: 48,
-      flexDirection: "row",
-      alignItems: "center",
-      justifyContent: "center",
-      gap: 6,
-      opacity: pressed ? 0.85 : 1,
-    }]}>
-      <Ionicons name={icon} size={16} color="#fff" />
-      <Text style={{ color: "#fff", fontWeight: "700", fontSize: 12 }}>{label}</Text>
+    <Pressable
+      testID={testID}
+      onPress={onPress}
+      style={({ pressed }) => [{
+        width: "48.5%",
+        backgroundColor: bg,
+        borderRadius: radius.md,
+        height: 48,
+        flexDirection: "row",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 6,
+        opacity: pressed ? 0.85 : 1,
+        paddingHorizontal: 8,
+      }]}
+    >
+      <Ionicons name={icon} size={16} color={textColor} />
+      <Text style={{ color: textColor, fontWeight: "700", fontSize: 12 }} numberOfLines={1}>
+        {label}
+      </Text>
     </Pressable>
   );
 }
@@ -310,7 +371,7 @@ const s = StyleSheet.create({
   loading: { alignItems: "center", padding: spacing.xxl, gap: spacing.md },
   loadingText: { color: colors.textMuted, fontSize: 13 },
   errBox: { padding: spacing.lg, gap: spacing.md, alignItems: "center" },
-  errText: { color: colors.bad, textAlign: "center" },
+  errText: { color: colors.bad, textAlign: "center", fontSize: 14 },
   retryBtn: { backgroundColor: colors.primary, paddingHorizontal: spacing.lg, height: 44, borderRadius: radius.md, alignItems: "center", justifyContent: "center" },
   retryText: { color: colors.primaryText, fontWeight: "700" },
   section: {
@@ -321,24 +382,58 @@ const s = StyleSheet.create({
     borderColor: colors.border,
     gap: spacing.sm,
   },
+  unavailableSection: {
+    borderColor: colors.warnBorder,
+    backgroundColor: colors.warnBg,
+  },
+  unavailableText: { color: "#7c5e0a", fontSize: 13, fontWeight: "600" },
   sectionTitle: { fontSize: 14, fontWeight: "800", color: colors.text },
   sectionSub: { fontSize: 11, color: colors.textMuted },
   rowBetween: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   subLabel: { fontSize: 10, fontWeight: "700", color: colors.textMuted, letterSpacing: 1, marginTop: 4 },
+  insightText: { fontSize: 13, color: colors.text, lineHeight: 19 },
   kpiGrid: { flexDirection: "row", gap: spacing.sm },
-  kpi: { flex: 1, backgroundColor: "#f1f5f9", borderRadius: radius.md, padding: spacing.sm },
+  kpi: { flex: 1, backgroundColor: colors.cardAlt, borderRadius: radius.md, padding: spacing.sm },
   kpiLabel: { fontSize: 9, color: colors.textMuted, fontWeight: "700", letterSpacing: 1 },
-  kpiValue: { fontSize: 16, fontWeight: "800", color: colors.text, marginTop: 4 },
-  chipRow: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
-  chip: { paddingHorizontal: spacing.sm, paddingVertical: 4, backgroundColor: "#eff6ff", borderRadius: radius.pill, borderWidth: 1, borderColor: "#bfdbfe" },
-  chipText: { color: colors.accent, fontSize: 11, fontWeight: "700" },
-  muted: { color: colors.textMuted, fontSize: 12 },
-  tipRow: { flexDirection: "row", gap: 6, alignItems: "flex-start", marginTop: 4 },
-  tipText: { flex: 1, fontSize: 12, color: colors.text },
-  soldRow: { flexDirection: "row", paddingVertical: spacing.sm, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.border, alignItems: "center" },
-  soldTitle: { fontSize: 13, color: colors.text, fontWeight: "600" },
-  soldMeta: { fontSize: 11, color: colors.textMuted, marginTop: 2 },
-  soldPrice: { fontSize: 14, fontWeight: "800", color: colors.text },
+  kpiValue: { fontSize: 15, fontWeight: "800", color: colors.text, marginTop: 4 },
+  livePill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: colors.goodBg,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    borderColor: colors.goodBorder,
+  },
+  liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: colors.good },
+  livePillText: { fontSize: 9, fontWeight: "800", color: colors.good, letterSpacing: 1 },
+  verdictPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 10,
+    borderRadius: radius.md,
+    alignSelf: "flex-start",
+  },
+  verdictText: { fontSize: 15, fontWeight: "800", letterSpacing: 0.5 },
+  mpGrid: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm, justifyContent: "space-between" },
+  listRow: {
+    flexDirection: "row",
+    paddingVertical: spacing.sm,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: colors.border,
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  listTitle: { fontSize: 13, color: colors.text, fontWeight: "600" },
+  listMeta: { fontSize: 11, color: colors.textMuted, marginTop: 2 },
+  listPriceCol: { alignItems: "flex-end" },
+  listPrice: { fontSize: 15, fontWeight: "800", color: colors.text },
+  listShip: { fontSize: 10, color: colors.textMuted, marginTop: 2 },
+  listShipFree: { fontSize: 10, color: colors.good, marginTop: 2, fontWeight: "700" },
   actionRow: { flexDirection: "row", gap: spacing.sm },
   actionBtn: {
     flex: 1,
@@ -351,35 +446,4 @@ const s = StyleSheet.create({
     backgroundColor: colors.primary,
   },
   actionText: { color: colors.primaryText, fontWeight: "700" },
-  mockBanner: {
-    flexDirection: "row",
-    gap: spacing.sm,
-    alignItems: "flex-start",
-    backgroundColor: colors.warnBg,
-    borderColor: colors.warnBorder,
-    borderWidth: 1,
-    padding: spacing.sm,
-    borderRadius: radius.md,
-  },
-  mockBannerText: { flex: 1, color: "#7c5e0a", fontSize: 12, fontWeight: "600", lineHeight: 17 },
-  mpGrid: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm },
-  comingRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.sm, flexWrap: "wrap" },
-  comingPill: { paddingHorizontal: spacing.sm, paddingVertical: 6, borderRadius: radius.pill, borderWidth: 1, borderColor: colors.border, backgroundColor: "#f1f5f9" },
-  comingText: { fontSize: 10, color: colors.textMuted, fontWeight: "700" },
-  comparisonGrid: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm },
-  compCard: {
-    flex: 1,
-    minWidth: "48%",
-    backgroundColor: "#f1f5f9",
-    borderRadius: radius.md,
-    padding: spacing.sm,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  compPlatform: { fontSize: 12, fontWeight: "800", color: colors.text, marginBottom: spacing.xs },
-  compPrices: { flexDirection: "row", gap: spacing.xs, marginBottom: spacing.xs },
-  compPrice: { flex: 1, alignItems: "center" },
-  compLabel: { fontSize: 9, fontWeight: "700", color: colors.textMuted, letterSpacing: 0.5 },
-  compValue: { fontSize: 13, fontWeight: "800", color: colors.accent, marginTop: 2 },
-  compCount: { fontSize: 10, color: colors.textMuted, fontWeight: "600" },
 });

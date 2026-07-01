@@ -15,7 +15,19 @@ type ReqOpts = {
   body?: any;
   headers?: Record<string, string>;
   isForm?: boolean;
+  signal?: AbortSignal;
+  timeoutMs?: number;
 };
+
+export class ApiError extends Error {
+  status: number;
+  detail: string;
+  constructor(status: number, detail: string) {
+    super(detail || `HTTP ${status}`);
+    this.status = status;
+    this.detail = detail;
+  }
+}
 
 export async function api<T = any>(path: string, opts: ReqOpts = {}): Promise<T> {
   const token = await getStoredToken();
@@ -23,24 +35,58 @@ export async function api<T = any>(path: string, opts: ReqOpts = {}): Promise<T>
   if (!opts.isForm) headers["Content-Type"] = "application/json";
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
-  const res = await fetch(`${BASE_URL}/api${path}`, {
-    method: opts.method || (opts.body ? "POST" : "GET"),
-    headers,
-    body: opts.isForm ? opts.body : opts.body ? JSON.stringify(opts.body) : undefined,
-  });
+  // Merge caller signal with internal timeout signal
+  const timeoutMs = opts.timeoutMs ?? 45_000;
+  const timeoutCtrl = new AbortController();
+  const timer = setTimeout(() => timeoutCtrl.abort(), timeoutMs);
+  const signal = opts.signal
+    ? anySignal([opts.signal, timeoutCtrl.signal])
+    : timeoutCtrl.signal;
 
-  const text = await res.text();
-  let data: any = null;
   try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = text;
+    const res = await fetch(`${BASE_URL}/api${path}`, {
+      method: opts.method || (opts.body ? "POST" : "GET"),
+      headers,
+      body: opts.isForm ? opts.body : opts.body ? JSON.stringify(opts.body) : undefined,
+      signal,
+    });
+
+    const text = await res.text();
+    let data: any = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text;
+    }
+    if (!res.ok) {
+      const detail = (data && (data.detail || data.message)) || text || `HTTP ${res.status}`;
+      const msg = typeof detail === "string" ? detail : JSON.stringify(detail);
+      throw new ApiError(res.status, msg);
+    }
+    return data as T;
+  } catch (e: any) {
+    if (e?.name === "AbortError") {
+      throw new ApiError(0, "Request timed out. Please check your connection and try again.");
+    }
+    if (e instanceof ApiError) throw e;
+    throw new ApiError(0, e?.message || "Network error");
+  } finally {
+    clearTimeout(timer);
   }
-  if (!res.ok) {
-    const detail = (data && (data.detail || data.message)) || text || `HTTP ${res.status}`;
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+}
+
+// Small helper: combine multiple AbortSignals into one
+function anySignal(signals: AbortSignal[]): AbortSignal {
+  const ctrl = new AbortController();
+  const onAbort = (s: AbortSignal) => () => ctrl.abort(s.reason);
+  for (const s of signals) {
+    if (s.aborted) {
+      ctrl.abort(s.reason);
+      break;
+    }
+    s.addEventListener("abort", onAbort(s), { once: true });
   }
-  return data as T;
+  return ctrl.signal;
 }
 
 export const apiBaseUrl = BASE_URL;
