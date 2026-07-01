@@ -67,7 +67,8 @@
       "router": {},
       "eas": {
         "projectId": "37ef8dba-5935-44cd-a889-548a5ed5f36d"
-      }
+      },
+      "backendUrl": "https://profit-scout-enhanced.onrender.com"
     }
   }
 }

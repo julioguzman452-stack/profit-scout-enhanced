@@ -3,8 +3,7 @@ import { storage } from "@/src/utils/storage";
 
 const TOKEN_KEY = "auth_token";
 
-const BASE_URL = process.env.EXPO_PUBLIC_BACKEND_URL || "";
-
+const BASE_URL = "https://profit-scout-enhanced.onrender.com";
 export const getStoredToken = async (): Promise<string | null> => {
   return (await storage.secureGet(TOKEN_KEY, "")) || null;
 };
